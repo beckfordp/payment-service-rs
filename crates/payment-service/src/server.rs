@@ -10,14 +10,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use axum::Router;
-use axum::routing::get;
 use service_basics::cors::{CorsPolicy, Unrouted};
 use service_basics::edge::edge;
 use service_basics::health::{self, Readiness};
 use service_basics::text_error::{self, TextError, method_not_allowed};
 use tokio::net::TcpListener;
 
-use crate::examples::get_example;
 use crate::store::Examples;
 
 /// How long readiness waits for Postgres to answer.
@@ -44,18 +42,13 @@ pub fn app<S: Examples>(store: S) -> Router {
     edge(routes(store), CorsPolicy::default())
 }
 
-/// The routes: health, the example, the docs (`crate::docs`), tapir's 405 for a known path with another
+/// The routes: health only (the RED skeleton), tapir's 405 for a known path with another
 /// method and 404 for any other.
 pub fn routes<S: Examples>(store: S) -> Router {
     health::routes()
-        .route(
-            "/examples/{id}",
-            get(get_example::<S>).head(method_not_allowed),
-        )
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
         .with_state(AppState { store })
-        .merge(crate::docs::router())
 }
 
 /// 404 for any unknown path, marked [`Unrouted`] for CORS.
