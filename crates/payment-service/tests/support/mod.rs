@@ -2,7 +2,7 @@
 
 //! Shared by the integration tests: gluon-rs `service-testing`'s throwaway
 //! PostgreSQL cluster, this service's store over it and its binary under
-//! test, an in-memory store for route tests, and a logger whose lines the
+//! test, a store that always fails, and a logger whose lines the
 //! test can read back.
 
 #![allow(
@@ -15,16 +15,20 @@
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use payment_service::config::{PORT_VARIABLE, PostgresConfig};
 use payment_service::db;
-use payment_service::domain::{Example, ExampleId};
-use payment_service::store::{Examples, PgExamples, StoreError};
+use payment_service::domain::{
+    Authorization, Payment, PaymentMethod, Reconciliation, ReconciliationStatus, ResolveOutcome,
+};
+use payment_service::store::{Payments, PgPayments, StoreError};
 use serde_json::Value;
+use sqlx::PgPool;
 use telemetry::logging::Logger;
+use time::OffsetDateTime;
+use uuid::Uuid;
 
 // Not every test file uses both.
 #[allow(unused_imports)]
@@ -68,7 +72,12 @@ impl DerefMut for Service {
 }
 
 /// The service's store over `postgres`, migrated as the service migrates it.
-pub async fn store(postgres: &Postgres) -> PgExamples {
+pub async fn store(postgres: &Postgres) -> PgPayments {
+    PgPayments::new(pool(postgres).await)
+}
+
+/// A pool on `postgres`, migrated as the service migrates it.
+pub async fn pool(postgres: &Postgres) -> PgPool {
     let env: HashMap<_, _> = postgres.env().into_iter().collect();
     let config = PostgresConfig {
         host: env["POSTGRES_HOST"].clone(),
@@ -79,56 +88,116 @@ pub async fn store(postgres: &Postgres) -> PgExamples {
     };
     let pool = db::connect(&config).await.unwrap();
     db::migrate(&pool).await.unwrap();
-    PgExamples::new(pool)
+    pool
 }
 
-/// An in-memory `example` table; `failing` makes every call fail as a
-/// database would, `down` makes the ping fail.
+/// A store whose every call fails as a database would, and whose ping fails.
 #[derive(Clone, Default)]
-pub struct Memory {
-    rows: Arc<Mutex<Vec<Example>>>,
-    pub failing: Arc<AtomicBool>,
-    pub down: Arc<AtomicBool>,
+pub struct Broken;
+
+fn broken<T>() -> Result<T, StoreError> {
+    Err(StoreError::Database(sqlx::Error::PoolClosed))
 }
 
-impl Memory {
-    /// Holding `rows`.
-    pub fn with(rows: Vec<Example>) -> Self {
-        Self {
-            rows: Arc::new(Mutex::new(rows)),
-            ..Self::default()
-        }
+impl Payments for Broken {
+    async fn add_method(&self, _: &PaymentMethod) -> Result<OffsetDateTime, StoreError> {
+        broken()
     }
-
-    fn fail(&self) -> Result<(), StoreError> {
-        if self.failing.load(Ordering::SeqCst) {
-            return Err(StoreError::Database(sqlx::Error::PoolClosed));
-        }
-        Ok(())
+    async fn method(&self, _: Uuid) -> Result<Option<PaymentMethod>, StoreError> {
+        broken()
+    }
+    async fn create(&self, _: &str, _: i32) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn get(&self, _: Uuid) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn delete(&self, _: Uuid) -> Result<bool, StoreError> {
+        broken()
+    }
+    async fn by_order(&self, _: &str) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn record_authorization(
+        &self,
+        _: &str,
+        _: i32,
+        _: Uuid,
+        _: &Authorization,
+    ) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn record_decline(
+        &self,
+        _: &str,
+        _: i32,
+        _: Uuid,
+        _: &str,
+    ) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn record_capture(&self, _: &str) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn record_capture_failure(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn record_void(&self, _: &str) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn expire_due(&self, _: i32) -> Result<Vec<Payment>, StoreError> {
+        broken()
+    }
+    async fn expire_now(&self, _: &str) -> Result<Option<Payment>, StoreError> {
+        broken()
+    }
+    async fn flag(&self, _: &str, _: &str) -> Result<bool, StoreError> {
+        broken()
+    }
+    async fn reconciliations(
+        &self,
+        _: Option<ReconciliationStatus>,
+        _: Option<&str>,
+    ) -> Result<Vec<Reconciliation>, StoreError> {
+        broken()
+    }
+    async fn resolve(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<&str>,
+        _: OffsetDateTime,
+    ) -> Result<ResolveOutcome, StoreError> {
+        broken()
+    }
+    async fn ping(&self, _: Duration) -> bool {
+        false
     }
 }
 
-impl Examples for Memory {
-    async fn get(&self, id: ExampleId) -> Result<Option<Example>, StoreError> {
-        self.fail()?;
-        Ok(self
-            .rows
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|row| row.id == id)
-            .cloned())
-    }
+/// The order's outbox rows' envelopes, in write order.
+pub async fn outbox(pool: &PgPool, order_id: &str) -> Vec<Value> {
+    let rows: Vec<(sqlx::types::Json<Value>,)> = sqlx::query_as(
+        "select payload from outbox_events where aggregate_id = $1 order by created_at, id",
+    )
+    .bind(order_id)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.into_iter().map(|(json,)| json.0).collect()
+}
 
-    async fn insert(&self, example: &Example) -> Result<(), StoreError> {
-        self.fail()?;
-        self.rows.lock().unwrap().push(example.clone());
-        Ok(())
-    }
-
-    async fn ping(&self, _within: Duration) -> bool {
-        !self.down.load(Ordering::SeqCst)
-    }
+/// The eventTypes of the order's outbox rows, in write order.
+pub async fn event_types(pool: &PgPool, order_id: &str) -> Vec<String> {
+    outbox(pool, order_id)
+        .await
+        .iter()
+        .map(|envelope| envelope["eventType"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 /// Where a [`captured_logger`] writes.

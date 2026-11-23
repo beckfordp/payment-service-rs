@@ -2,13 +2,15 @@
 
 //! The `payment-service` binary: reads the config contract, migrates the
 //! database, then serves the HTTP API and runs the Kafka
-//! consumers until SIGTERM or SIGINT. A consumer or
+//! consumers and the expiry sweep until SIGTERM or SIGINT. A consumer or
 //! server that stops by itself stops the service, non-zero (Scala
 //! `KafkaConsumers.watched`).
 
 use kafka_client::supervised::ConsumerTelemetry;
 use payment_service::config::{self, Config};
-use payment_service::store::PgExamples;
+use payment_service::domain::{OperatorAuth, SimulatedGateway};
+use payment_service::server::AppState;
+use payment_service::store::PgPayments;
 use payment_service::{consumers, lifecycle};
 use payment_service::{db, server};
 use service_basics::{environment, runtime, shutdown};
@@ -75,7 +77,13 @@ async fn serve(config: &Config, tracer: SdkTracer) -> ExitCode {
         &[("port", &config.port.to_string())],
         "payment-service starting",
     );
-    let store = PgExamples::new(pool);
+    let store = PgPayments::new(pool);
+    let state = AppState {
+        store: store.clone(),
+        gateway: SimulatedGateway::default(),
+        auth: OperatorAuth::new(&config.operator_token, &config.operator_id),
+        logger: logger.clone(),
+    };
     let telemetry = ConsumerTelemetry {
         tracer,
         logger: logger.clone(),
@@ -88,13 +96,12 @@ async fn serve(config: &Config, tracer: SdkTracer) -> ExitCode {
             let until_stopped = async move {
                 let _ = stopped.wait_for(|stop| *stop).await;
             };
-            server::run(port, store, until_stopped).await
+            server::run(port, state, until_stopped).await
         }
     };
     let consumers = {
-        let bootstrap = config.kafka_bootstrap.clone();
-        let logger = logger.clone();
-        async move { consumers::run(&bootstrap, logger, telemetry, stopped).await }
+        let (bootstrap, interval) = (config.kafka_bootstrap.clone(), config.sweep_interval);
+        async move { consumers::run(&bootstrap, store, interval, telemetry, stopped).await }
     };
     let signal = shutdown::signal(SERVICE);
     if lifecycle::run_until_stopped(server, consumers, signal, stop, &logger).await {
