@@ -382,6 +382,12 @@ impl Default for SimulatedGateway {
     }
 }
 
+/// `at` truncated to the microseconds Postgres `timestamptz` keeps, so what is
+/// returned now matches what a replay reads back.
+fn to_micros(at: OffsetDateTime) -> OffsetDateTime {
+    at - Duration::nanoseconds(i64::from(at.nanosecond() % 1_000))
+}
+
 impl SimulatedGateway {
     /// A hold on `card_token` placed at `now`, or the decline reason.
     ///
@@ -396,7 +402,7 @@ impl SimulatedGateway {
             Some(Outcome::Decline(reason)) => Err(reason.clone()),
             Some(Outcome::Approve) | None => Ok(Authorization {
                 auth_id: format!("auth_{}", Uuid::new_v4()),
-                expires_at: now + self.ttl,
+                expires_at: to_micros(now + self.ttl),
             }),
         }
     }

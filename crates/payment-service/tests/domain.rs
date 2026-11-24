@@ -10,8 +10,8 @@ use payment_service::domain::{
     PaymentStatus, Race, ReconciliationStatus, SimulatedGateway, VOID_AFTER_CAPTURE, is_live,
     method_rules, parse_uuid, payment_rules, race,
 };
+use time::Duration;
 use time::macros::datetime;
-use time::{Duration, OffsetDateTime};
 
 const NOV_2026: (i32, u8) = (2026, 11);
 
@@ -179,10 +179,11 @@ fn a_lost_transition_is_classified_as_scala_does() {
 #[test]
 fn the_simulated_gateway_declines_its_test_cards() {
     let gateway = SimulatedGateway::default();
-    let now = OffsetDateTime::now_utc();
+    // Linux clocks give nanoseconds; the hold keeps the microseconds Postgres stores.
+    let now = datetime!(2026-11-24 10:00:00.123_456_789 UTC);
     let hold = gateway.authorize("tok_visa_4242", now).unwrap();
     assert!(hold.auth_id.starts_with("auth_"));
-    assert_eq!(hold.expires_at, now + Duration::days(7));
+    assert_eq!(hold.expires_at, datetime!(2026-12-01 10:00:00.123_456 UTC));
     assert_eq!(
         gateway.authorize("tok_visa_0002", now).unwrap_err(),
         "insufficient_funds"
